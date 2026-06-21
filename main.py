@@ -13,7 +13,9 @@ if __name__ == "__main__":
     #      then validate.  Original called run_covid_eda_all() on a
     #      SchemaValidation instance which works via inheritance but is misleading.
     schema_validator = SchemaValidation(url=CONFIG["url"], limit=CONFIG["limit"])
-    schema_validator.load_data().clean_data().run_schema()
+    schema_validator.load_data()\
+        .clean_data()\
+        .run_schema()
  
     # --- Pipeline / business-logic validation ---
     pipeline = PipelineValidation(
@@ -21,7 +23,14 @@ if __name__ == "__main__":
         limit=CONFIG["limit"],
         duplicate_threshold=CONFIG["duplicate_threshold"],
         missing_threshold=CONFIG["missing_threshold"],
+        top_counties = CONFIG["top_counties"],
+        data_min = CONFIG["data_min"]   
+        date_max  = CONFIG["date_max"] 
     )
     pipeline.load_data()\
         .clean_data()\
         .run_pipeline_validation()
+    
+
+
+

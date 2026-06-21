@@ -16,7 +16,12 @@ class PipelineValidation(Covid_EDA):
     All thresholds are passed in fron CONFIG at the top of the script
     """
     
-    def __init__(self, url, limit, duplicate_threshold, missing_threshold):
+    def __init__(self, 
+                 url                    : str, 
+                 limit                  : int, 
+                 duplicate_threshold    : int, 
+                 missing_threshold      : float
+                ):
         """
         url = CDC API point, passed in from CONFIG
         limit = number of rows to be loaded passed in from CONFIG
@@ -26,17 +31,18 @@ class PipelineValidation(Covid_EDA):
         super().__init__(url, limit)
         self.duplicate_threshold = duplicate_threshold
         self.missing_threshold = missing_threshold
-        self.validation_results = []            # stores pass or fail results for each rule
+        self.validation_results = list [dict] = []            # stores pass or fail results for each rule
 
     # NOT SURE WTF IS HAPPENING HERE
-    def _record(self, rule, passed, detail="", warning=False):
+    # Internal helper
+    def _record(self, rule: str, passed: str, detail: str= "", warning: bool =False):
         """
         INTERNAL HELPER THAT RECORDS THE RESULT OF EACH VALIDATION RULE.
         USES _ PREFIX TO SIGNAL THIS METHOD FOR INTERNAL USE ONLY.
-        APPENDS A RESULT TO A DICTIONARY FOR seld.validation_results and prints a one line summary for each rule
+        Records results of a validation rule and prints a one line summary for each rule
         There are 3 possible statuses:
         PASSED - rule satisfied, data looks correct
-        WARNING - rule violate but plausible, flag for review
+        WARNING - rule violated but plausible, flag for review
         FAILED - rule broken and likely indicates a data error
         """
         if passed:
@@ -61,8 +67,8 @@ class PipelineValidation(Covid_EDA):
         and not in the future
         This rule violation would be a hard fail
         """
-        earliest = pd.Timestamp("2020-01-01")
-        latest = pd.Timestamp("2024-07-05")         
+        earliest = pd.Timestamp(CONFIG["date_min"])
+        latest = pd.Timestamp(CONFIG["date_max"])       
 
         # Identify rows where case_month is outside the valid range
         out_of_range = self.df[
@@ -71,7 +77,7 @@ class PipelineValidation(Covid_EDA):
         ]
         passed = len(out_of_range) == 0
         self._record(
-            rule = "Date range check (2020-01-01 to 2024-07-05)",
+            rule = f"Date range check ({CONFIG["date_min"]} to {CONFIG["date_max"]})",
             passed = passed, 
             detail = f"{len(out_of_range):,} rows outside the valid range",
             warning = False
@@ -114,7 +120,7 @@ class PipelineValidation(Covid_EDA):
             rule = "Hospitalization without record of symptoms, should be reviewed",
             passed = not warning, 
             detail = (
-                f"{len(flagged):,} patients hospitalized without symptom record," 
+                f"{len(flagged):,} patients hospitalized without symptom record;" 
             "may reflect missing data rather than asymptomatic cases"
             if warning 
             else
@@ -142,7 +148,7 @@ class PipelineValidation(Covid_EDA):
             rule = "Deaths without hospitalization; review recommended",
             passed = not warning, 
             detail = (
-                f"{len(flagged):,} deaths recorded without hospitalization,"
+                f"{len(flagged):,} deaths recorded without hospitalization;"
                 "plausible but flagged for review"
                 if warning 
                 else
@@ -227,8 +233,91 @@ class PipelineValidation(Covid_EDA):
                   .to_string(index=False)
                   )
         return self
-
     
+
+    # validation rule 7
+    def check_age_group_values(self):
+        """
+        Verify that age_group contains only known CDC bins
+        An API change can introduce a new bin or rename an exisiting one,
+        which would break alll age-stratified analyses without this check.
+        """
+        if "age_group" not in self.df.columns:
+            self._record(
+                rule = "Age group enumeration check",
+                passed = False,
+                detail = "Column "age_group" not found in dataset",
+                warning= False
+            )
+            return self
+        
+        unknown_ages = self.df[
+            self.df["age_group".isin(CDC_AGE_GROUP_VALUES)] &
+            self.df["age_group"].notna()
+        ]
+        passed - len(unknown_ages) == 0
+        self._record(
+            rule = "Age group enumeration check",
+            passed = passed, 
+            detail = (
+                f"{len(unknown_ages):,} rows contain unrecognised age_group values:"
+                f"{unknown_ages["age_group"].unique().tolist()}"
+                if not passed
+                else 
+                "All age group value match known CDC age bins"
+            ), warning = False
+        )
+        return self
+    
+
+    # Rule 8 — NEW (Layer 2 recommendation)
+    def check_binary_field_distributions(self):
+        """
+        Sanity-check the marginal distributions of exposure_yn and
+        underlying_conditions_yn.
+ 
+        A value that is "Yes" in > 99% or < 1% of non-null rows is suspicious
+        and may indicate a coding change or a batch data error rather than a
+        true epidemiological signal.
+        """
+        fields_to_check = {
+            "exposure_yn"                : (0.01, 0.99),
+            "underlying_conditions_yn"   : (0.01, 0.99),
+        }
+ 
+        for col, (low, high) in fields_to_check.items():
+            if col not in self.df.columns:
+                continue
+ 
+            yes_rate = (
+                (self.df[col] == "Yes").sum() /
+                self.df[col].notna().sum()
+            ) if self.df[col].notna().sum() > 0 else None
+ 
+            if yes_rate is None:
+                self._record(
+                    rule    = f"Distribution sanity check — {col}",
+                    passed  = False,
+                    detail  = f"All values in '{col}' are null; cannot evaluate distribution",
+                    warning = True,
+                )
+            elif yes_rate < low or yes_rate > high:
+                self._record(
+                    rule    = f"Distribution sanity check — {col}",
+                    passed  = False,
+                    detail  = (
+                        f"'{col}' Yes-rate is {yes_rate:.1%}, outside expected "
+                        f"range [{low:.0%}, {high:.0%}] — possible encoding shift"
+                    ),
+                    warning = True,
+                )
+            else:
+                self._record(
+                    rule   = f"Distribution sanity check — {col}",
+                    passed = True,
+                    detail = f"Yes-rate = {yes_rate:.1%} (within expected range)",
+                )
+        return self
 
 
     def validation_summary(self):
@@ -260,6 +349,9 @@ class PipelineValidation(Covid_EDA):
         .check_death_sans_hospitalization()        
         .checking_missing_threshold()
         .check_repeated_combinations()
+        .check_age_group_values()
+        .check_binary_field_distributions()
         .validation_summary()
         )
+
         
