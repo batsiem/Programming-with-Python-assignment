@@ -1,0 +1,8 @@
+
+{
+    // matplotlib and seaborn ship incomplete type stubs (**kwargs: Unknown).
+    // These rules suppress the resulting noise without affecting runtime behaviour.
+    // Revisit when matplotlib-stubs improves.
+    "reportUnknownMemberType": "none",
+    "reportUnknownVariableType": "none"
+}
