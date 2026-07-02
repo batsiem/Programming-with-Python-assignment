@@ -16,6 +16,9 @@ class AnomalyDetection(SchemaValidation):
         # Store results from all anomaly detection checks 
         self.anomaly_results = []
 
+        # populated by capture lineage(); empty until method runs
+        self.lineage: dict = {}
+
     @property
     def _monthly_cases(self) -> pd.Series:
         """
@@ -204,21 +207,151 @@ class AnomalyDetection(SchemaValidation):
 
         return self
 
-    # Calling full pipeline
+
+    def check_interval_consistency(self):
+        """
+        Temporal validation using case_onset_interval / case_positive_specimen_interval.
+ 
+        CDC suppresses raw dates in this dataset for privacy (e.g. date of
+        first positive specimen is an "indirect identifier"). Both interval
+        columns are offsets, in the same units, from one shared hidden
+        reference date — so their relationship to each other is checkable
+        even though the real dates aren't visible:
+ 
+          1. Neither interval can be negative. Since both are measured
+             forward from the same reference point, a negative value is
+             impossible under the data's own definition — a hard fail.
+          2. A very large gap between the two intervals is unusual but not
+             impossible (e.g. pre-symptomatic testing, or a late-reported
+             onset) — flagged as a warning, not a hard fail.
+        """
+        self._assert_clean("check_interval_consistency")
+        df = self._require_df()
+ 
+        interval_cols = ("case_onset_interval", "case_positive_specimen_interval")
+        missing_cols = [c for c in interval_cols if c not in df.columns]
+        if missing_cols:
+            self._record(
+                rule="Interval consistency check",
+                passed=False,
+                detail=f"Column(s) not found in dataset: {missing_cols}",
+                warning=True,
+            )
+            return self
+ 
+        onset = df["case_onset_interval"]
+        specimen = df["case_positive_specimen_interval"]
+ 
+        # ---- Rule 1: negative intervals (hard fail) ------------------
+        # notna() first so pd.NA rows are excluded rather than producing
+        # an ambiguous boolean mask.
+        negative = df[
+            (onset.notna() & (onset < 0)) |
+            (specimen.notna() & (specimen < 0))
+        ]
+        passed_negative = len(negative) == 0
+        self._record(
+            rule="Interval consistency — no negative intervals",
+            passed=passed_negative,
+            detail=(
+                f"{len(negative):,} rows have a negative onset or specimen interval"
+                if not passed_negative
+                else "No negative intervals found"
+            ),
+            warning=False,
+        )
+ 
+        # ---- Rule 2: implausibly large gap between the two (warning) --
+        max_gap = CONFIG["max_interval_gap_weeks"]
+        both_present = onset.notna() & specimen.notna()
+        gap = (onset - specimen).abs()
+ 
+        large_gap = df[both_present & (gap > max_gap)]
+        warning = len(large_gap) > 0
+        self._record(
+            rule=f"Interval consistency — onset/specimen gap (> {max_gap} weeks)",
+            passed=not warning,
+            detail=(
+                f"{len(large_gap):,} rows have an onset/specimen interval gap "
+                f"exceeding {max_gap} weeks; plausible (e.g. pre-symptomatic "
+                "testing) but flagged for review"
+                if warning
+                else f"All onset/specimen interval gaps are within {max_gap} weeks"
+            ),
+            warning=warning,
+        )
+ 
+        return self
+ 
+    def capture_lineage(self):
+        """
+        Lightweight data lineage / provenance snapshot.
+ 
+        Captures where the data came from, when this snapshot was taken,
+        how large the dataset currently is, its overall completeness, and
+        a rollup of every check recorded so far in self.anomaly_results.
+ 
+        LIMITATION: this timestamps "when capture_lineage() ran," not "when
+        load_data() ran" — Covid_EDA.load_data()/clean_data() don't
+        currently record their own timestamps or row counts. For a fuller
+        before/after picture (e.g. rows or values lost during cleaning),
+        load_data() and clean_data() would need to stamp
+        self.rows_loaded / self.rows_after_cleaning themselves. This method
+        works with what's available today without modifying those methods.
+        """
+        self._assert_clean("capture_lineage")
+        df = self._require_df()
+ 
+        total_cells = df.shape[0] * df.shape[1]
+        missing_cells = int(df.isnull().sum().sum())
+        completeness_pct = (
+            100 * (1 - missing_cells / total_cells) if total_cells else 0.0
+        )
+ 
+        status_counts = {"PASSED": 0, "WARNING": 0, "FAILED": 0}
+        for entry in self.anomaly_results:
+            status_counts[entry["Status"]] = status_counts.get(entry["Status"], 0) + 1
+ 
+        self.lineage = {
+            "captured_at": pd.Timestamp.now().isoformat(),
+            "source_url": self.url,
+            "row_count": df.shape[0],
+            "column_count": df.shape[1],
+            "completeness_pct": round(completeness_pct, 2),
+            "anomaly_checks_passed": status_counts["PASSED"],
+            "anomaly_checks_warning": status_counts["WARNING"],
+            "anomaly_checks_failed": status_counts["FAILED"],
+        }
+ 
+        print("\n" + "=" * 55)
+        print("DATA LINEAGE SNAPSHOT")
+        print("=" * 55)
+        for key, value in self.lineage.items():
+            print(f"  {key:<24}: {value}")
+        print("=" * 55)
+ 
+        return self
+ 
+    # ------------------------------------------------------------------
+    # Full pipeline
+    # ------------------------------------------------------------------
+ 
     def run_anomaly_detection(self):
         """
         Run all anomaly detection checks in one call.
-        Requires load_data().clean_data() to be called first.
+        Requires load_data().clean_data() to have been called first.
         """
         if self.df is None or not self._is_clean:
             raise RuntimeError(
-                "Run load_data().clean_data() first"
+                "Run load_data().clean_data() first."
             )
-        (
-         self
+        (self
             .check_monthly_case_anomalies()
             .check_change_points()
             .check_age_distribution_drift()
-            .check_future_dates   
+            .check_future_dates()
+            .check_interval_consistency()
+            .capture_lineage()
         )
-        return self
+        return self   
+
