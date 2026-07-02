@@ -1,15 +1,16 @@
-from config import CONFIG
-from eda import Covid_EDA
-from schema_validation import SchemaValidation
+from config import CONFIG, CDC_SYMPTOM_STATUS_VALUES, CDC_AGE_GROUP_VALUES
+from Anomaly_Detection import AnomalyDetection
 import pandas as pd
-from statsmodels.tsa.seasonal import STL
-import ruptures as rpt
 import warnings
+ 
 warnings.filterwarnings('ignore')
-
-class PipelineValidation(Covid_EDA):
+ 
+class Pipelinelogic_Validation(AnomalyDetection):
     """
-    Child class that inherits from parent class Covid_EDA.
+    Child class that inherits from AnomalyDetection, which itself inherits
+    from SchemaValidation -> Covid_EDA. This puts run_anomaly_detection()
+    in the same MRO as run_businessrule_validation(), so both are
+    reachable in a single fluent chain on one pipeline object.
     Enforces business logic rules on the dataset ti ensure that data is not only schematically correct 
     but actually makes logical sense.
     This class checks that data values are logically consistent e.d death date cannot be before case report date.
@@ -31,11 +32,10 @@ class PipelineValidation(Covid_EDA):
         super().__init__(url, limit)
         self.duplicate_threshold = duplicate_threshold
         self.missing_threshold = missing_threshold
-        self.validation_results = list [dict] = []            # stores pass or fail results for each rule
-
-    # NOT SURE WTF IS HAPPENING HERE
+        self.validation_results: list [dict] = []            # stores pass or fail results for each rule
+ 
     # Internal helper
-    def _record(self, rule: str, passed: str, detail: str= "", warning: bool =False):
+    def _record(self, rule: str, passed: bool, detail: str= "", warning: bool =False):
         """
         INTERNAL HELPER THAT RECORDS THE RESULT OF EACH VALIDATION RULE.
         USES _ PREFIX TO SIGNAL THIS METHOD FOR INTERNAL USE ONLY.
@@ -51,14 +51,14 @@ class PipelineValidation(Covid_EDA):
             status = "WARNING"          # soft violation, suspicious but not necessarily wrong
         else:
             status = "FAILED"           # hard violation, data is likely incorrect
-
+ 
         self.validation_results.append({
             "Rule" : rule,
             "Status" : status,
             "Detail" : detail
         })
         print(f"[{status}] {rule}" + (f" - {detail}" if detail else""))
-
+ 
     
     # Validation rule 1
     def check_date_range(self):
@@ -67,17 +67,19 @@ class PipelineValidation(Covid_EDA):
         and not in the future
         This rule violation would be a hard fail
         """
+        df = self._require_df()
         earliest = pd.Timestamp(CONFIG["date_min"])
         latest = pd.Timestamp(CONFIG["date_max"])       
-
+ 
         # Identify rows where case_month is outside the valid range
-        out_of_range = self.df[
-            (self.df["case_month"] < earliest) |
-            (self.df["case_month"] > latest)
+        # (comparisons against NaT are always False, so no NA-masking risk here)
+        out_of_range = df[
+            (df["case_month"] < earliest) |
+            (df["case_month"] > latest)
         ]
         passed = len(out_of_range) == 0
         self._record(
-            rule = f"Date range check ({CONFIG["date_min"]} to {CONFIG["date_max"]})",
+            rule = f"Date range check ({CONFIG['date_min']} to {CONFIG['date_max']})",
             passed = passed, 
             detail = f"{len(out_of_range):,} rows outside the valid range",
             warning = False
@@ -90,9 +92,15 @@ class PipelineValidation(Covid_EDA):
         Enforces the rule that icu_yn == "Yes" only when hosp_yn =="Yes". A patient can't be in ICU without being hosipitalized
         This rule violation would be a hard fail, as it is clinically impossible
         """
-        invalid = self.df[
-            (self.df["icu_yn"] == "Yes") &
-            (self.df["hosp_yn"] != "Yes")
+        # BUG FIX: clean_data() replaces placeholder strings with pd.NA. A
+        # `!= "Yes"` comparison against pd.NA evaluates to pd.NA (not False),
+        # and indexing a DataFrame with a mask containing pd.NA raises
+        # ValueError. .fillna(False) treats "hosp_yn unknown" as "not a
+        # confirmed violation" rather than crashing on missing data.
+        df = self._require_df()
+        invalid = df[
+            (df["icu_yn"] == "Yes") &
+            (df["hosp_yn"] != "Yes").fillna(False)
         ]
         passed = len(invalid) == 0
         self._record(
@@ -110,18 +118,21 @@ class PipelineValidation(Covid_EDA):
         This is a warning because symptom_status is typically missing in surveillance data 
         and an absense of symptom record does not necessarily mean that the patient is asymptomatic
         """
-        flagged = self.df[
-            (self.df["hosp_yn"] == "Yes") &
-            (self.df["symptom_status"] != "Symptomatic")
+        # BUG FIX: same pd.NA-in-boolean-mask issue as above — a missing
+        # symptom_status must not crash the comparison.
+        df = self._require_df()
+        flagged = df[
+            (df["hosp_yn"] == "Yes") &
+            (df["symptom_status"] != "Symptomatic").fillna(False)
         ]
-
+ 
         warning = len(flagged) > 0
         self._record(
             rule = "Hospitalization without record of symptoms, should be reviewed",
             passed = not warning, 
             detail = (
-                f"{len(flagged):,} patients hospitalized without symptom record;" 
-            "may reflect missing data rather than asymptomatic cases"
+                f"{len(flagged):,} patients hospitalized without symptom record; " 
+                "may reflect missing data rather than asymptomatic cases"
             if warning 
             else
             "All hospitalised patients have a symptom record"
@@ -138,40 +149,42 @@ class PipelineValidation(Covid_EDA):
         being admitted to a hospital.
         This rule violation is flagged for human review
         """
-        flagged = self.df[
-            (self.df["death_yn"] == "Yes") &
-            (self.df["hosp_yn"] != "Yes")
+        # BUG FIX: same pd.NA-in-boolean-mask issue as above.
+        df = self._require_df()
+        flagged = df[
+            (df["death_yn"] == "Yes") &
+            (df["hosp_yn"] != "Yes").fillna(False)
         ]
     
         warning = len(flagged) > 0
         self._record(
-            rule = "Deaths without hospitalization; review recommended",
+            rule = "Deaths without hospitalization; review recommended ",
             passed = not warning, 
             detail = (
-                f"{len(flagged):,} deaths recorded without hospitalization;"
+                f"{len(flagged):,} deaths recorded without hospitalization; "
                 "plausible but flagged for review"
                 if warning 
                 else
-                "All deaths match with a hospitalization record"
+                "All deaths match with a hospitalization record "
                 ),
                 warning = warning
             )
         return self
-
+ 
     # Validation rule 5
     def checking_missing_threshold(self):
         """
         Flag any column where more than threshold percent of values are missing, because columns with excessive
         missingness are unreliable for analysis. 
         Default value is 80%
-        TRY AND REVERSE CODE WITH LIMIT OF 20% MISSINGNESS
         """
-        missing_pct = self.df.isnull().mean()*100
+        df = self._require_df()
+        missing_pct = df.isnull().mean()*100
         high_missing = missing_pct[missing_pct> self.missing_threshold]
-
+ 
         passed = len(high_missing) == 0
         self._record(
-            rule = f"Missing valur threshold (<{self.missing_threshold}% per column)",
+            rule = f"Missing value threshold (<{self.missing_threshold}% per column)",
             passed = passed,
             detail = (
                 " ,".join(
@@ -181,87 +194,89 @@ class PipelineValidation(Covid_EDA):
             )
         )
         return self 
-
-
+ 
+ 
     # validation rule 6
     def check_repeated_combinations(self):
-        """
-        CDC Dataset does not contain unique identifiers (they were stripped for privacy), so fully duplicated rows can be expected
-        as many patients with share similar race, age range, state and month tested.
-        This rule, checks for excessively repeated combinations such as case_month + res_state + age_group + sex +  race. 
-        This could be indicative of data feed error or repeated API ingestion, rather than actual case volume.
-        """
-        # Define columns that combined together form a logical grouping key
-        # These are the fields that are most likely to be identical across real cases
+        df = self._require_df()
         duplicate_threshold = self.duplicate_threshold
         group_cols = [
             "case_month", "res_state", "age_group",
-            "sex", "race", "death_yn", "hosp_yn"
+            "sex", "race", "death_yn", "hosp_yn",  "current_status"
         ]
-        # Using columns that strictly exist in the dataset
         available_cols = [
-            col for col in group_cols if col in self.df.columns
+            col for col in group_cols if col in df.columns
         ]
-        
-        # Count how many times each combo appears 
+ 
+        # guard against no usable columns
+        if not available_cols:
+            self._record(
+                rule="Suspicious duplicate combinations",
+                passed=False,
+                detail="No grouping columns available in dataset — check column names",
+                warning=True
+            )
+            return self
+ 
         group_counts = (
-            self.df 
+            df
             .groupby(available_cols, dropna=False)
             .size()
             .reset_index(name="count")
         )
-
-        suspicious = group_counts[group_counts["count"]> duplicate_threshold]
+ 
+        suspicious = group_counts[group_counts["count"] > duplicate_threshold]
         warning = len(suspicious) > 0
-
+ 
         self._record(
-            rule = f"Suspicious duplicate combinations (threshold: > {duplicate_threshold} rows)",
-            passed = not warning,
-            detail= (
+            rule=f"Suspicious duplicate combinations (threshold: > {duplicate_threshold} rows)",
+            passed=not warning,
+            detail=(
                 f"{len(suspicious):,} combinations exceed threshold - possible repeated data"
-                if warning 
-                else
-                "No suspiciously repeated combinations found" 
+                if warning
+                else "No suspiciously repeated combinations found"
             ),
-            warning = warning, 
+            warning=warning,
         )
-    
+ 
         if warning:
             print("\nTop suspicious combinations")
             print(suspicious.sort_values("count", ascending=False)
-                  .head()
-                  .to_string(index=False)
-                  )
+                .head()
+                .to_string(index=False))
         return self
     
-
+ 
     # validation rule 7
     def check_age_group_values(self):
         """
-        Verify that age_group contains only known CDC bins
+        Verify that age_group contains only known CDC age bins
         An API change can introduce a new bin or rename an exisiting one,
         which would break alll age-stratified analyses without this check.
         """
-        if "age_group" not in self.df.columns:
+        df = self._require_df()
+        if "age_group" not in df.columns:
             self._record(
                 rule = "Age group enumeration check",
                 passed = False,
-                detail = "Column "age_group" not found in dataset",
+                detail = "Column 'age_group' not found in dataset",
                 warning= False
             )
             return self
         
-        unknown_ages = self.df[
-            self.df["age_group".isin(CDC_AGE_GROUP_VALUES)] &
-            self.df["age_group"].notna()
+        # isin() and notna() both return real booleans (never NA), so this
+        # mask is safe to index with as-is.
+        unknown_ages = df[
+            (~df["age_group"].isin(CDC_AGE_GROUP_VALUES)) &
+            df["age_group"].notna()
         ]
-        passed - len(unknown_ages) == 0
+        passed = len(unknown_ages) == 0
         self._record(
             rule = "Age group enumeration check",
             passed = passed, 
             detail = (
                 f"{len(unknown_ages):,} rows contain unrecognised age_group values:"
-                f"{unknown_ages["age_group"].unique().tolist()}"
+                f"{unknown_ages['age_group'].unique().tolist()}"
                 if not passed
                 else 
                 "All age group value match known CDC age bins"
@@ -269,39 +284,41 @@ class PipelineValidation(Covid_EDA):
         )
         return self
     
-
+ 
     # Rule 8 — NEW (Layer 2 recommendation)
     def check_binary_field_distributions(self):
         """
-        Sanity-check the marginal distributions of exposure_yn and
+        Sanity-check marginal Yes-rates for exposure_yn and
         underlying_conditions_yn.
  
-        A value that is "Yes" in > 99% or < 1% of non-null rows is suspicious
-        and may indicate a coding change or a batch data error rather than a
-        true epidemiological signal.
+        A Yes-rate outside [1%, 99%] may indicate a coding change or a
+        batch data error rather than a true epidemiological signal.
         """
+        df = self._require_df()
         fields_to_check = {
-            "exposure_yn"                : (0.01, 0.99),
-            "underlying_conditions_yn"   : (0.01, 0.99),
+            "exposure_yn"              : (0.01, 0.99),
+            "underlying_conditions_yn" : (0.01, 0.99),
         }
  
         for col, (low, high) in fields_to_check.items():
-            if col not in self.df.columns:
-                continue
+            if col not in df.columns:
+                continue                                  # column absent — skip silently
  
-            yes_rate = (
-                (self.df[col] == "Yes").sum() /
-                self.df[col].notna().sum()
-            ) if self.df[col].notna().sum() > 0 else None
+            non_null = df[col].notna().sum()
  
-            if yes_rate is None:
+            if non_null == 0:
                 self._record(
                     rule    = f"Distribution sanity check — {col}",
                     passed  = False,
                     detail  = f"All values in '{col}' are null; cannot evaluate distribution",
                     warning = True,
                 )
-            elif yes_rate < low or yes_rate > high:
+                continue
+ 
+            # yes_rate is always float here — the None branch above already handled 0 rows
+            yes_rate = (df[col] == "Yes").sum() / non_null
+ 
+            if yes_rate < low or yes_rate > high:
                 self._record(
                     rule    = f"Distribution sanity check — {col}",
                     passed  = False,
@@ -317,9 +334,10 @@ class PipelineValidation(Covid_EDA):
                     passed = True,
                     detail = f"Yes-rate = {yes_rate:.1%} (within expected range)",
                 )
+ 
         return self
-
-
+ 
+ 
     def validation_summary(self):
         """
         Print a summary table of all validation results showing how many rules passed,
@@ -328,20 +346,24 @@ class PipelineValidation(Covid_EDA):
         results_df = pd.DataFrame(self.validation_results)
         total = len(results_df)
         passed = (results_df["Status"] == "PASSED").sum()
-        warnings = (results_df["Status"] == "WARNING").sum()
+        warning_count = (results_df["Status"] == "WARNING").sum()
         failed = (results_df["Status"] == "FAILED").sum()
-
+ 
         print("\n"+ "="*55)
         print("PIPELINE VALIDATION SUMMARY")
         print("="*55)
         print(results_df.to_string(index=False))
         print("="*55)
-        print(f"Total: {total} | Passed: {passed} | Warnings: {warnings} | Failed: {failed}")
+        print(f"Total: {total} | Passed: {passed} | Warnings: {warning_count} | Failed: {failed}")
         print("="*55)
         return self 
     
-    def run_pipeline_validation(self):
+    def run_businessrule_validation(self):
         """Run all pipeline validation rules in one call"""
+        if self.df is None or not self._is_clean:
+             raise RuntimeError(
+        "Run load_data().clean_data() first."
+        )     
         (self
         .check_date_range()
         .check_icu_against_hospitalization()
@@ -352,6 +374,6 @@ class PipelineValidation(Covid_EDA):
         .check_age_group_values()
         .check_binary_field_distributions()
         .validation_summary()
-        )
-
-        
+           )
+        return self
+ 

@@ -2,7 +2,7 @@
     "python-envs.defaultEnvManager": "ms-python.python:system",
     "python-envs.pythonProjects": [
         {
-            "path": "eda.py",
+            "path": "EDA.py",
             "envManager": "ms-python.python:system",
             "packageManager": "ms-python.python:pip"
         }
